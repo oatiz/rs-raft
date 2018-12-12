@@ -1,6 +1,6 @@
 /// 节点状态
 pub enum StateRole {
-    /// 跟随者, (如果它接收不到leader的消息,那么他就要变成candidate)
+    /// 跟随者, (如果它接收不到leader的消息,那么它就要变成candidate)
     FOLLOWER,
     /// 候选人, (发起投票选举,获得大部分票行,会变为leader)
     Candidate,
@@ -13,7 +13,6 @@ impl Default for StateRole {
         StateRole::FOLLOWER
     }
 }
-
 
 pub struct Raft {
     // 所有服务器上持久存在的
