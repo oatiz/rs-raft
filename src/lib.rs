@@ -11,5 +11,10 @@ extern crate quick_error;
 extern crate env_logger;
 extern crate rand;
 
+pub mod eraft_demo;
+mod errors;
+
 #[cfg(test)]
-pub mod raft;
+mod raft;
+mod raft_log;
+mod storage;
