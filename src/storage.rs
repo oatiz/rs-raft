@@ -1,4 +1,4 @@
-use eraft_demo::{HardState, ConfState};
+use eraftpb::{HardState, ConfState, Entry};
 
 use errors::{Error, Result, StorageError};
 

@@ -11,7 +11,7 @@ extern crate quick_error;
 extern crate env_logger;
 extern crate rand;
 
-pub mod eraft_demo;
+pub mod eraftpb;
 mod errors;
 
 #[cfg(test)]
