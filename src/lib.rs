@@ -17,4 +17,5 @@ mod errors;
 #[cfg(test)]
 mod raft;
 mod raft_log;
-mod storage;
+pub mod storage;
+pub mod util;
