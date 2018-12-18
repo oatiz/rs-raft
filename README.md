@@ -6,7 +6,9 @@ Raft实现Rust版.
 ## 背景
 目的是为了学习Rust和[`Raft`](https://raft.github.io/raft.pdf)
 
-实现细节参考[pingcap](https://github.com/pingcap)的[raft-rs](https://github.com/pingcap/raft-rs)
+core模块:实现细节~~参考~~照抄[pingcap](https://github.com/pingcap)的[raft-rs](https://github.com/pingcap/raft-rs)
+
+[TODO] 未来会自己写存储部分
 
 ## 概念
 
