@@ -1,3 +1,5 @@
+use raft_log::RaftLog;
+
 /// 节点状态
 pub enum StateRole {
     /// 跟随者, (如果它接收不到leader的消息,那么它就要变成candidate)
@@ -12,6 +14,12 @@ impl Default for StateRole {
     fn default() -> StateRole {
         StateRole::FOLLOWER
     }
+}
+
+#[derive(Default, PartialEq, Debug)]
+pub struct SoftState {
+    pub leader_id: u64,
+    pub raft_state: StateRole,
 }
 
 pub struct Raft {
@@ -29,7 +37,8 @@ pub struct Raft {
     pub vote_for: u64,
 
     /// 日志集合 (每条日志包含一个用户状态机执行的指令和收到的任期号)
-    pub log: Vec![],
+    //    pub log: Vec![],
+    pub raft_log: RaftLog<T>,
 
     // 所有服务器上经常变的
     /// 已知的最大的已经被提交的日志条目的索引值
