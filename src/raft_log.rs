@@ -299,4 +299,16 @@ impl<T: Storage> RaftLog<T> {
 
         Ok(entries)
     }
+
+    pub fn restore(&mut self, snapshot: Snapshot) {
+        info!(
+            "{} log [{}] starts to restore snapshot [index: {}, term: {}]",
+            self.tag,
+            self.to_string(),
+            snapshot.get_metadata().get_index(),
+            snapshot.get_metadata().get_term()
+        );
+        self.committed = snapshot.get_metadata().get_index();
+        self.unstable.restore(snapshot);
+    }
 }

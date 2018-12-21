@@ -15,9 +15,11 @@ pub mod eraftpb;
 mod errors;
 
 mod log_unstable;
+mod progress;
 #[cfg(test)]
 mod raft;
 mod raft_log;
+mod read_only;
 pub mod storage;
 pub mod util;
 
