@@ -67,6 +67,22 @@ impl ProgressSet {
     }
 
     #[inline]
+    pub fn votes_mut(&mut self) -> impl Iterator<Item = (&u64, &mut Progress)> {
+        let vote_ids = &self.configuration.voters;
+        self.progress
+            .iter_mut()
+            .filter(move |(k, _)| vote_ids.contains(k))
+    }
+
+    #[inline]
+    pub fn learners_mut(&mut self) -> impl Iterator<Item = (&u64, &mut Progress)> {
+        let learner_ids = &self.configuration.learners;
+        self.progress
+            .iter_mut()
+            .filter(move |(k, _)| learner_ids.contains(k))
+    }
+
+    #[inline]
     pub fn voter_ids(&self) -> &FxHashSet<u64> {
         &self.configuration.voters
     }
@@ -74,6 +90,65 @@ impl ProgressSet {
     #[inline]
     pub fn learner_ids(&self) -> &FxHashSet<u64> {
         &self.configuration.learners
+    }
+
+    #[inline]
+    pub fn get(&self, id: u64) -> Option<&Progress> {
+        self.progress.get(&id)
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut Progress> {
+        self.progress.get_mut(&id)
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (u64, &Progress)> {
+        self.progress.iter()
+    }
+
+    #[inline]
+    pub fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (u64, &mut Progress)> {
+        self.progress.iter_mut()
+    }
+
+    pub fn insert_voter(&mut self, id: u64, progress: Progress) -> Result<(), Error> {
+        if self.progress.contains_key(&id) {
+            if self.learner_ids().contains(&id) {
+                return Err(Error::Exists(id, "learners"));
+            }
+            return Err(Error::Exists(id, "voters"));
+        }
+        self.configuration.voters.insert(id);
+        self.progress.insert(id, progress);
+        self.assert_progress_and_configuration_consistent();
+
+        Ok(())
+    }
+
+    pub fn insert_learner(&mut self, id: u64, progress: Progress) -> Result<(), Error> {
+        if self.progress.contains_key(&id) {
+
+        }
+
+        Ok(())
+    }
+
+    fn assert_progress_and_configuration_consistent(&self) {
+        debug_assert!(self
+            .configuration
+            .voters
+            .union(&self.configuration.learners)
+            .all(|v| self.progress.contains_key(v)));
+        debug_assert!(self
+            .progress
+            .keys()
+            .all(|v| self.configuration.learners.contains(v)
+                || self.configuration.voters.contains(v)));
+        assert_eq!(
+            self.configuration.voters.len() + self.configuration.learners.len(),
+            self.progress.len()
+        );
     }
 }
 
