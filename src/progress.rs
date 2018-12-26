@@ -1,8 +1,15 @@
-use errors::Error;
-use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::cmp;
 use std::collections::{HashMap, HashSet};
+
+use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
+
+use errors::Error;
+
+#[inline]
+fn majority(total: usize) -> usize {
+    (total / 2) + 1
+}
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ProgressState {
@@ -21,6 +28,13 @@ impl Default for ProgressState {
 struct Configuration {
     voters: FxHashSet<u64>,
     learners: FxHashSet<u64>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum CandidacyStatus {
+    Elected,
+    Eligible,
+    Ineligible,
 }
 
 #[derive(Default, Clone)]
@@ -128,12 +142,40 @@ impl ProgressSet {
 
     pub fn insert_learner(&mut self, id: u64, progress: Progress) -> Result<(), Error> {
         if self.progress.contains_key(&id) {
-
+            if self.learner_ids().contains(&id) {
+                return Err(Error::Exist(id, "learners"));
+            }
+            return Err(Error::Exist(id, "votes"));
         }
+        self.configuration.learners.insert(id);
+        self.progress.insert(id, progress);
+        self.assert_progress_and_configuration_consistent();
 
         Ok(())
     }
 
+    pub fn remove(&mut self, id: u64) -> Option<Progress> {
+        self.configuration.voters.remove(&id);
+        self.configuration.learners.remove(&id);
+        let removed = self.progress.remove(&id);
+        self.assert_progress_and_configuration_consistent();
+
+        removed
+    }
+
+    pub fn promote_learner(&mut self, id: u64) -> Result<(), Error> {
+        if !self.configuration.learners.remove(&id) {
+            return Err(Error::NotExists(id, "learners"));
+        }
+        if !self.configuration.voters.remove(&id) {
+            return Err(Error::NotExists(id, "voters"));
+        }
+        self.assert_progress_and_configuration_consistent();
+
+        Ok(())
+    }
+
+    #[inline(always)]
     fn assert_progress_and_configuration_consistent(&self) {
         debug_assert!(self
             .configuration
@@ -149,6 +191,73 @@ impl ProgressSet {
             self.configuration.voters.len() + self.configuration.learners.len(),
             self.progress.len()
         );
+    }
+
+    pub fn maximal_committed_index(&self) -> u64 {
+        let mut matched = self.sort_buffer.borrow_mut();
+        matched.clear();
+        self.voters().for_each(|(_id, peer)| {
+            matched.push(peer.matched);
+        });
+        matched.sort_by(|a, b| b.cmp(a));
+
+        matched[matched.len() / 2]
+    }
+
+    pub fn candidacy_status<'a>(
+        &self,
+        id: u64,
+        votes: impl IntoIterator<Item = (&'a u64, &'a bool)>,
+    ) -> CandidacyStatus {
+        let (accepted, total) =
+            votes
+                .into_iter()
+                .fold((0, 0), |(mut accepted, mut total), (_, nominated)| {
+                    if *nominated {
+                        accepted += 1;
+                    }
+                    total += 1;
+                    (accepted, total)
+                });
+        let quorum = majority(self.voter_ids().len());
+        let rejected = total - accepted;
+
+        info!(
+            "{} [quorum: {}] has received {} votes and {} votes rejections",
+            id, quorum, accepted, rejected
+        );
+
+        if accepted >= quorum {
+            CandidacyStatus::Elected
+        } else if rejected == quorum {
+            CandidacyStatus::Eligible
+        } else {
+            CandidacyStatus::Ineligible
+        }
+    }
+
+    pub fn quorum_recently_active(&mut self, perspective_of: u64) -> bool {
+        let mut active = 0;
+        for (&id, progress) in self.votes_mut() {
+            if id == perspective_of {
+                active += 1;
+                continue;
+            }
+            if progress.recent_active {
+                active += 1;
+            }
+
+            progress.recent_active = false;
+        }
+        for (&id, progress) in self.learners_mut() {
+            progress.recent_active = false;
+        }
+
+        active >= majority(self.voter_ids().len())
+    }
+
+    pub fn has_quorum(&self, potential_quorum: &FxHashSet<u64>) -> bool {
+        potential_quorum.len() >= majority(self.voter_ids().len())
     }
 }
 
