@@ -272,9 +272,124 @@ pub struct Progress {
     pub ins: Inflights,
 }
 
+impl Progress {
+    pub fn new(next_idx: u64, ins_size: usize) -> Progress {
+        Progress {
+            matched: 0,
+            next_idx: 0,
+            state: ProgressState::Probe,
+            paused: false,
+            pending_snapshot: 0,
+            recent_active: false,
+            ins: Inflights::new(ins_size),
+        }
+    }
+
+    pub fn reset_state(&mut self, state: ProgressState) {
+        self.paused = false;
+        self.pending_snapshot = 0;
+        self.state = state;
+        self.ins.reset();
+    }
+
+    pub(crate) fn reset(&mut self, next_idx: u64) {
+        self.matched = 0;
+        self.next_idx = next_idx;
+        self.state = ProgressState::default();
+        self.paused = false;
+        self.pending_snapshot = 0;
+        self.recent_active = false;
+        debug_assert!(self.ins.cap() != 0);
+        self.ins.reset();
+    }
+
+    pub fn become_probe(&mut self) {
+        if self.state == ProgressState::Snapshot {
+            let pending_snapshot = self.pending_snapshot;
+            self.reset_state(ProgressState::Probe);
+            self.next_idx = cmp::max(self.matched + 1, pending_snapshot + 1);
+        } else {
+            self.reset_state(ProgressState::Probe);
+            self.next_idx = self.matched + 1;
+        }
+    }
+}
+
 pub struct Inflights {
     start: usize,
     count: usize,
 
     buffer: Vec<u64>,
+}
+
+impl Inflights {
+    pub fn new(cap: usize) -> Inflights {
+        Inflights {
+            start: 0,
+            count: 0,
+            buffer: Vec::with_capacity(cap),
+        }
+    }
+
+    pub fn full(&self) -> bool {
+        self.count == self.cap()
+    }
+
+    pub fn cap(&self) -> usize {
+        self.buffer.capacity()
+    }
+
+    pub fn add(&mut self, inflight: u64) {
+        if self.full() {
+            panic!("cannot add into a full inflights");
+        }
+
+        let mut next = self.start + self.count;
+        if next >= self.cap() {
+            next -= self.cap();
+        }
+        assert!(next <= self.buffer.len());
+
+        if next == self.buffer.len() {
+            self.buffer.push(inflight);
+        } else {
+            self.buffer[next] = inflight;
+        }
+
+        self.count += 1;
+    }
+
+    pub fn free_to(&mut self, to: u64) {
+        if self.count == 0 || to < self.buffer[self.start] {
+            return;
+        }
+
+        let mut i = 0usize;
+        let mut idx = self.start;
+        while i < self.count {
+            if to < self.buffer[idx] {
+                break;
+            }
+
+            idx += 1;
+            if idx >= self.cap() {
+                idx -= self.cap();
+            }
+
+            i += 1
+        }
+
+        self.count -= i;
+        self.start = idx;
+    }
+
+    pub fn free_first_one(&mut self) {
+        let start = self.buffer[self.start];
+        self.free_to(start);
+    }
+
+    pub fn reset(&mut self) {
+        self.count = 0;
+        self.start = 0;
+    }
 }
