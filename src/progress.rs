@@ -313,6 +313,80 @@ impl Progress {
             self.next_idx = self.matched + 1;
         }
     }
+
+    pub fn become_replicate(&mut self) {
+        self.reset_state(ProgressState::Replicate);
+        self.next_idx = self.matched + 1;
+    }
+
+    pub fn become_snapshot(&mut self, snapshot_idx: u64) {
+        self.reset_state(ProgressState::Snapshot);
+        self.next_idx = snapshot_idx;
+    }
+
+    pub fn snapshot_failure(&mut self) {
+        self.pending_snapshot = 0;
+    }
+
+    pub fn maybe_snapshot_abort(&self) -> bool {
+        self.state == ProgressState::Snapshot && self.matched >= self.pending_snapshot
+    }
+
+    pub fn maybe_update(&mut self, n: u64) -> bool {
+        let need_update = self.matched < n;
+        if need_update {
+            self.matched = n;
+            self.resume();
+        }
+
+        if self.next_idx < n + 1 {
+            self.next_idx = n + 1;
+        }
+
+        need_update
+    }
+
+    pub fn optimistic_update(&mut self, n: u64) {
+        self.next_idx = n + 1;
+    }
+
+    pub fn maybe_decr_to(&mut self, rejected: u64, last: u64) -> bool {
+        if self.state == ProgressState::Replicate {
+            if rejected <= self.matched {
+                return false;
+            }
+            self.next_idx = self.matched + 1;
+            return true;
+        }
+
+        if self.next_idx == 0 || self.next_idx - 1 != rejected {
+            return false;
+        }
+
+        self.next_idx = cmp::min(rejected, last + 1);
+        if self.next_idx < 1 {
+            self.next_idx = 1;
+        }
+        self.resume();
+
+        true
+    }
+
+    pub fn is_paused(&self) -> bool {
+        match self.state {
+            ProgressState::Probe => self.paused,
+            ProgressState::Replicate => self.ins.full(),
+            ProgressState::Snapshot => true,
+        }
+    }
+
+    pub fn resume(&mut self) {
+        self.paused = false;
+    }
+
+    pub fn pause(&mut self) {
+        self.paused = true;
+    }
 }
 
 pub struct Inflights {
