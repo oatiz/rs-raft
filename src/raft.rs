@@ -1,6 +1,9 @@
 use super::raft_log::{self, RaftLog};
 use super::read_only::{ReadOnly, ReadOnlyOption, ReadState};
 use super::storage::Storage;
+use super::ProgressSet;
+use eraftpb::{Entry, EntryType, HardState, Message, MessageType, Snapshot};
+use fxhash::{FxHashMap, FxHashSet};
 
 /// 节点状态
 pub enum StateRole {
@@ -41,7 +44,41 @@ pub struct Raft<T: Storage> {
 
     pub max_msg_size: u64,
 
-    prs: vec![],
+    prs: Option<ProgressSet>,
+
+    pub is_learner: bool,
+
+    pub votes: FxHashMap<u64, bool>,
+
+    pub msgs: Vec<Message>,
+
+    pub learner_id: u64,
+
+    pub lead_transferee: Option<u64>,
+
+    pub pending_conf_index: u64,
+
+    pub read_only: ReadOnly,
+
+    pub election_elapsed: usize,
+
+    heartbeat_elapsed: usize,
+
+    pub check_quorum: bool,
+
+    pub pre_vote: bool,
+
+    heartbeat_timeout: usize,
+
+    election_timeout: usize,
+
+    randomized_election_timeout: usize,
+
+    min_election_timeout: usize,
+
+    max_election_timeout: usize,
+
+    tag: String,
 }
 
 //pub struct Raft {
@@ -75,3 +112,30 @@ pub struct Raft<T: Storage> {
 //    /// 每个服务器已给复制的日志最高索引值
 //    pub match_index: Vec![],
 //}
+
+trait AssertSend: Send {}
+
+impl<T: Storage + Send> AssertSend for Raft<T> {}
+
+fn new_message(to: u64, field_type: MessageType, from: Option<u64>) -> Message {
+    let mut msg = Message::new();
+    msg.set_to(to);
+    if let Some(id) = from {
+        msg.set_from(id);
+    }
+    msg.set_msg_type(field_type);
+
+    msg
+}
+
+pub fn vote_resp_msg_type(msg_type: MessageType) -> MessageType {
+    match msg_type {
+        MessageType::MsgRequestVote => MessageType::MsgRequestVoteResponse,
+        MessageType::MsgRequestPreVote => MessageType::MsgRequestPreVoteResponse,
+        _ => panic!("not a vote message: {:?}", msg_type),
+    }
+}
+
+impl<T: Storage> Raft<T> {
+    pub fn new (cfg: &Config)
+}
