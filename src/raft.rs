@@ -1,9 +1,12 @@
+use super::errors::{Error, Result, StorageError};
+use super::progress::{CandidacyStatus, Progress, ProgressSet, ProgressState};
 use super::raft_log::{self, RaftLog};
 use super::read_only::{ReadOnly, ReadOnlyOption, ReadState};
 use super::storage::Storage;
-use super::ProgressSet;
+use super::Config;
 use eraftpb::{Entry, EntryType, HardState, Message, MessageType, Snapshot};
 use fxhash::{FxHashMap, FxHashSet};
+use rand::{self, Rng};
 
 /// 节点状态
 pub enum StateRole {
@@ -20,6 +23,9 @@ impl Default for StateRole {
         StateRole::FOLLOWER
     }
 }
+
+pub const INVALID_ID: u64 = 0;
+pub const INVALID_INDEX: u64 = 0;
 
 #[derive(Default, PartialEq, Debug)]
 pub struct SoftState {
@@ -67,6 +73,8 @@ pub struct Raft<T: Storage> {
     pub check_quorum: bool,
 
     pub pre_vote: bool,
+
+    skip_bcast_commit: bool,
 
     heartbeat_timeout: usize,
 
@@ -137,5 +145,125 @@ pub fn vote_resp_msg_type(msg_type: MessageType) -> MessageType {
 }
 
 impl<T: Storage> Raft<T> {
-    pub fn new (cfg: &Config)
+    pub fn new(cfg: &Config, storage: T) -> Result<Raft<T>> {
+        cfg.validate()?;
+        let rs = storage.initial_state()?;
+        let conf_state = &rs.conf_state;
+        let raft_log = RaftLog::new(storage, cfg.tag.clone());
+        let mut peers: &[u64] = &cfg.peers;
+        let mut learners: &[u64] = &cfg.learners;
+        if !conf_state.get_nodes().is_empty() || !conf_state.get_learners().is_empty() {
+            if !peers.is_empty() || !learners.is_empty() {
+                panic!(
+                    "{} cannot specify both new(peers/learners) and ConfState.(Nodes/Learners)",
+                    cfg.tag
+                );
+            }
+            peers = conf_state.get_nodes();
+            learners = conf_state.get_learners();
+        }
+
+        let mut raft = Raft {
+            id: cfg.id,
+            state: StateRole::FOLLOWER,
+            term: Default::default(),
+            vote: Default::default(),
+            read_state: Default::default(),
+            log: raft_log,
+            max_inflight: cfg.max_inflight_msgs,
+            max_msg_size: cfg.max_size_per_msg,
+            prs: Some(ProgressSet::with_capacity(peers.len(), learners.len())),
+            is_learner: false,
+            votes: Default::default(),
+            msgs: Default::default(),
+            learner_id: Default::default(),
+            lead_transferee: None,
+            pending_conf_index: Default::default(),
+            read_only: ReadOnly::new(cfg.read_only_option),
+            election_elapsed: Default::default(),
+            heartbeat_elapsed: Default::default(),
+            check_quorum: cfg.check_quorum,
+            pre_vote: cfg.pre_vote,
+            skip_bcast_commit: cfg.skip_bcast_commit,
+            heartbeat_timeout: cfg.heartbeat_tick,
+            election_timeout: cfg.election_tick,
+            randomized_election_timeout: 0,
+            min_election_timeout: cfg.min_election_tick,
+            max_election_timeout: cfg.max_election_tick,
+            tag: cfg.tag.to_owned(),
+        };
+
+        for peer in peers {
+            let progress = Progress::new(1, raft.max_inflight);
+            if let Err(e) = raft.mut_prs().insert_learner(*peer, progress) {
+                panic!("{}", e);
+            };
+        }
+        for learner in learners {
+            let progress = Progress::new(1, raft.max_inflight);
+            if let Err(e) = raft.mut_prs().insert_learner(*learner, progress) {
+                panic!("{}", e);
+            };
+            if *learner == raft.id {
+                raft.is_learner = true;
+            }
+        }
+
+        if rs.hard_state != HardState::new() {
+            raft.load_state(&rs.hard_state);
+        }
+        if cfg.applied > 0 {
+            raft.log.applied_to(cfg.applied);
+        }
+        let term = raft.term;
+
+        Ok(())
+    }
+
+    pub fn reset(&mut self, term: u64) {
+        if self.term != term {
+            self.term = term;
+            self.vote = INVALID_ID;
+        }
+        self.learner_id = INVALID_ID;
+        self.reset_randomized_election_timeout();
+        self.election_elapsed = 0;
+        self.heartbeat_elapsed = 0;
+
+        //        self.
+    }
+
+    pub fn become_fowller(&mut self, term: u64, leader_id: u64) {
+        self.re
+    }
+
+    pub fn mut_prs(&mut self) -> &mut ProgressSet {
+        self.prs.as_mut().unwrap()
+    }
+
+    pub fn load_state(&mut self, hs: &HardState) {
+        if hs.get_commit() < self.log.committed || hs.get_commit() > self.log.last_index() {
+            panic!(
+                "{} hs.commit {} is out of range [{}, {}]",
+                self.tag,
+                hs.get_commit(),
+                self.log.committed,
+                self.log.last_index(),
+            );
+        }
+        self.log.committed = hs.get_commit();
+        self.term = hs.get_term();
+        self.vote = hs.get_vote();
+    }
+
+    pub fn reset_randomized_election_timeout(&mut self) {
+        let prev_timeout = self.randomized_election_timeout;
+        let timeout =
+            rand::thread_rng().gen_range(self.min_election_timeout, self.max_election_timeout);
+        debug!(
+            "{} reset election timeout {} -> {} at {}",
+            self.tag, prev_timeout, timeout, self.election_elapsed
+        );
+        self.randomized_election_timeout = timeout;
+    }
 }

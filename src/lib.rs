@@ -11,6 +11,8 @@ extern crate quick_error;
 extern crate env_logger;
 extern crate rand;
 
+mod config;
+
 pub mod eraftpb;
 mod errors;
 
