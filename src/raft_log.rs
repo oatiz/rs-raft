@@ -180,7 +180,7 @@ impl<T: Storage> RaftLog<T> {
         self.applied = idx;
     }
 
-    pub fn get_append(&self) -> u64 {
+    pub fn get_applied(&self) -> u64 {
         self.applied
     }
 

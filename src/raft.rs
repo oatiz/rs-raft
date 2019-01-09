@@ -44,7 +44,7 @@ pub struct Raft<T: Storage> {
 
     pub read_state: Vec<ReadState>,
 
-    pub log: RaftLog<T>,
+    pub raft_log: RaftLog<T>,
 
     pub max_inflight: usize,
 
@@ -58,7 +58,7 @@ pub struct Raft<T: Storage> {
 
     pub msgs: Vec<Message>,
 
-    pub learner_id: u64,
+    pub leader_id: u64,
 
     pub lead_transferee: Option<u64>,
 
@@ -169,14 +169,14 @@ impl<T: Storage> Raft<T> {
             term: Default::default(),
             vote: Default::default(),
             read_state: Default::default(),
-            log: raft_log,
+            raft_log,
             max_inflight: cfg.max_inflight_msgs,
             max_msg_size: cfg.max_size_per_msg,
             prs: Some(ProgressSet::with_capacity(peers.len(), learners.len())),
             is_learner: false,
             votes: Default::default(),
             msgs: Default::default(),
-            learner_id: Default::default(),
+            leader_id: Default::default(),
             lead_transferee: None,
             pending_conf_index: Default::default(),
             read_only: ReadOnly::new(cfg.read_only_option),
@@ -213,11 +213,47 @@ impl<T: Storage> Raft<T> {
             raft.load_state(&rs.hard_state);
         }
         if cfg.applied > 0 {
-            raft.log.applied_to(cfg.applied);
+            raft.raft_log.applied_to(cfg.applied);
         }
         let term = raft.term;
+        raft.become_follower(term, INVALID_ID);
+        info!(
+            "{} new raft [peers: {:?}, term: {:?}, commit: {}, applied: {}, last_index: {}, last_term: {}]",
+            raft.tag,
+            raft.prs().voters().collect::<Vec<_>>(),
+            raft.term,
+            raft.raft_log.committed,
+            raft.raft_log.get_applied(),
+            raft.raft_log.last_index(),
+            raft.raft_log.last_term()
+        );
 
         Ok(())
+    }
+
+    #[inline]
+    pub fn get_store(&self) -> &T {
+        self.raft_log.get_store()
+    }
+
+    #[inline]
+    pub fn mut_store(&mut self) -> &mut T {
+        self.raft_log.mut_store()
+    }
+
+    #[inline]
+    pub fn get_snap(&self) -> Option<&Snapshot> {
+        self.raft_log.get_unstable().snapshot.as_ref()
+    }
+
+    #[inline]
+    pub fn pending_read_count(&self) -> usize {
+        self.read_only.pending_read_count()
+    }
+
+    #[inline]
+    pub fn ready_read_count(&self) -> usize {
+        self.read_state.len()
     }
 
     pub fn reset(&mut self, term: u64) {
@@ -230,11 +266,32 @@ impl<T: Storage> Raft<T> {
         self.election_elapsed = 0;
         self.heartbeat_elapsed = 0;
 
-        //        self.
+        self.abort_leader_transfer();
+
+        self.votes.clear();
+
+        self.pending_conf_index = 0;
+        self.read_only = ReadOnly::new(self.read_only.option);
+
+        let last_index = self.raft_log.last_index();
+        let self_id = self.id;
+        for (&id, progress) in self.mut_prs().iter_mut() {
+            progress.reset(last_index + 1);
+            if id == self_id {
+                progress.matched = last_index;
+            }
+        }
     }
 
-    pub fn become_fowller(&mut self, term: u64, leader_id: u64) {
-        self.re
+    pub fn become_follower(&mut self, term: u64, leader_id: u64) {
+        self.reset(term);
+        self.leader_id = leader_id;
+        self.state = StateRole::FOLLOWER;
+        info!("{} become follower at term {}", self.tag, self.term);
+    }
+
+    pub fn prs(&self) -> &ProgressSet {
+        self.prs.as_ref().unwrap()
     }
 
     pub fn mut_prs(&mut self) -> &mut ProgressSet {
@@ -242,16 +299,16 @@ impl<T: Storage> Raft<T> {
     }
 
     pub fn load_state(&mut self, hs: &HardState) {
-        if hs.get_commit() < self.log.committed || hs.get_commit() > self.log.last_index() {
+        if hs.get_commit() < self.raft_log.committed || hs.get_commit() > self.raft_log.last_index() {
             panic!(
                 "{} hs.commit {} is out of range [{}, {}]",
                 self.tag,
                 hs.get_commit(),
-                self.log.committed,
-                self.log.last_index(),
+                self.raft_log.committed,
+                self.raft_log.last_index(),
             );
         }
-        self.log.committed = hs.get_commit();
+        self.raft_log.committed = hs.get_commit();
         self.term = hs.get_term();
         self.vote = hs.get_vote();
     }
@@ -265,5 +322,9 @@ impl<T: Storage> Raft<T> {
             self.tag, prev_timeout, timeout, self.election_elapsed
         );
         self.randomized_election_timeout = timeout;
+    }
+
+    pub fn abort_leader_transfer(&mut self) {
+        self.lead_transferee = None
     }
 }
