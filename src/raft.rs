@@ -256,6 +256,82 @@ impl<T: Storage> Raft<T> {
         self.read_state.len()
     }
 
+    pub fn soft_state(&self) -> SoftState {
+        SoftState {
+            leader_id: self.leader_id,
+            raft_state: self.state,
+        }
+    }
+
+    pub fn hard_state(&self) -> HardState {
+        let mut hs = HardState::new();
+        hs.set_term(self.term);
+        hs.set_vote(self.vote);
+        hs.set_commit(self.raft_log.committed);
+
+        hs
+    }
+
+    pub fn in_lease(&self) -> bool {
+        self.state == StateRole::Leader && self.check_quorum
+    }
+
+    pub fn set_randomized_election_timeout(&mut self, timeout: usize) {
+        assert!(self.min_election_timeout <= t && t < self.max_election_timeout);
+        self.randomized_election_timeout = timeout;
+    }
+
+    pub fn get_election_timeout(&self) -> usize {
+        self.election_timeout
+    }
+
+    pub fn get_heartbeat_timeout(&self) -> usize {
+        self.heartbeat_timeout
+    }
+
+    pub fn get_randomized_timeout(&self) -> usize {
+        self.randomized_election_timeout
+    }
+
+    #[inline]
+    pub fn skip_bcast_commit(&mut self, skip: bool) {
+        self.skip_bcast_commit = skip;
+    }
+
+    fn send(&mut self, mut msg: Message) {
+        msg.set_from(self.id);
+        if msg.get_msg_type() == MessageType::MsgRequestVote
+            || msg.get_msg_type() == MessageType::MsgRequestPreVote
+            || msg.get_msg_type() == MessageType::MsgRequestVoteResponse
+            || msg.get_msg_type() == MessageType::MsgRequestPreVoteResponse
+        {
+            if msg.get_term() == 0 {
+                panic!(
+                    "{} term should be set when sending {:?}",
+                    self.tag,
+                    msg.get_msg_type()
+                );
+            }
+        } else {
+            if msg.get_term() == 0 {
+                panic!(
+                    "{} term should be set when sending {:?} (was {})",
+                    self.tag,
+                    msg.get_msg_type(),
+                    msg.get_term()
+                );
+            }
+
+            if msg.get_msg_type() != MessageType::MsgPropose
+                && msg.get_msg_type() != MessageType::MsgReadIndex
+            {
+                msg.set_term(self.term);
+            }
+        }
+
+        self.msgs.push(msg);
+    }
+
     pub fn reset(&mut self, term: u64) {
         if self.term != term {
             self.term = term;
@@ -299,7 +375,8 @@ impl<T: Storage> Raft<T> {
     }
 
     pub fn load_state(&mut self, hs: &HardState) {
-        if hs.get_commit() < self.raft_log.committed || hs.get_commit() > self.raft_log.last_index() {
+        if hs.get_commit() < self.raft_log.committed || hs.get_commit() > self.raft_log.last_index()
+        {
             panic!(
                 "{} hs.commit {} is out of range [{}, {}]",
                 self.tag,

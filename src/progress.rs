@@ -55,9 +55,12 @@ impl ProgressSet {
 
     pub fn with_capacity(voters: usize, learners: usize) -> ProgressSet {
         ProgressSet {
-            progress: HashMap::with_capacity_and_hasher(votes + learners, FxBuildHasher::default()),
+            progress: HashMap::with_capacity_and_hasher(
+                voters + learners,
+                FxBuildHasher::default(),
+            ),
             configuration: Configuration {
-                voters: HashSet::with_capacity_and_hasher(votes, FxBuildHasher::default()),
+                voters: HashSet::with_capacity_and_hasher(voters, FxBuildHasher::default()),
                 learners: HashSet::with_capacity_and_hasher(learners, FxBuildHasher::default()),
             },
             sort_buffer: Default::default(),

@@ -173,7 +173,7 @@ impl<T: Storage> RaftLog<T> {
         if self.committed < idx || idx < self.applied {
             panic!(
                 "{} applied({}) is out of range [prev_applied({}), committed({})]",
-                self.tag, self.applied, self.committed
+                self.tag, idx, self.applied, self.committed
             );
         }
 
