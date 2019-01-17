@@ -4,9 +4,20 @@ use super::raft_log::{self, RaftLog};
 use super::read_only::{ReadOnly, ReadOnlyOption, ReadState};
 use super::storage::Storage;
 use super::Config;
+use core::cmp;
 use eraftpb::{Entry, EntryType, HardState, Message, MessageType, Snapshot};
 use fxhash::{FxHashMap, FxHashSet};
+use protobuf::RepeatedField;
 use rand::{self, Rng};
+
+// CAMPAIGN_PRE_ELECTION represents the first phase of a normal election when
+// Config.pre_vote is true.
+const CAMPAIGN_PRE_ELECTION: &[u8] = b"CampaignPreElection";
+// CAMPAIGN_ELECTION represents a normal (time-based) election (the second phase
+// of the election when Config.pre_vote is true).
+const CAMPAIGN_ELECTION: &[u8] = b"CampaignElection";
+// CAMPAIGN_TRANSFER represents the type of leader transfer.
+const CAMPAIGN_TRANSFER: &[u8] = b"CampaignTransfer";
 
 /// 节点状态
 pub enum StateRole {
@@ -332,6 +343,143 @@ impl<T: Storage> Raft<T> {
         self.msgs.push(msg);
     }
 
+    pub fn prepare_send_snapshot(&mut self, msg: &mut Message, pr: &mut Progress, to: u64) -> bool {
+        if !pr.recent_active {
+            debug!(
+                "{} ignore sending snapshot to {} since it is not recently active",
+                self.tag, to
+            );
+            return false;
+        }
+
+        msg.set_msg_type(MessageType::MsgSnapshot);
+        let snapshot_r = self.raft_log.snapshot();
+        if let Err(e) = snapshot_r {
+            if e == Error::Store(StorageError::SnapshotTemporarilyUnavailable) {
+                debug!(
+                    "{} failed to send snapshot to {} because snapshot is temporarily unavailable",
+                    self.tag, to
+                );
+                return false;
+            }
+            panic!("{} unexpected error: {:?}", self.tag, e);
+        }
+
+        let snapshot = snapshot_r.unwrap();
+        if snapshot.get_metadata().get_index() == 0 {
+            panic!("{} need non-empty snapshot", self.tag);
+        }
+        let (s_index, s_term) = (
+            snapshot.get_metadata().get_index(),
+            snapshot.get_metadata().get_term(),
+        );
+        msg.set_snapshot(snapshot);
+        debug!(
+            "{} [first_index: {}, commit: {}] send snapshot[index: {}, term: {}] to {} [{:?}]",
+            self.tag,
+            self.raft_log.first_index(),
+            self.raft_log.committed,
+            s_index,
+            s_term,
+            to,
+            pr
+        );
+
+        pr.become_snapshot(s_index);
+        debug!(
+            "{} paused sending replication message to {} [{:?}]",
+            self.tag, to, pr
+        );
+
+        true
+    }
+
+    fn prepare_send_entries(
+        &mut self,
+        msg: &mut Message,
+        pr: &mut Progress,
+        term: u64,
+        ents: Vec<Entry>,
+    ) {
+        msg.set_msg_type(MessageType::MsgAppend);
+        msg.set_index(pr.next_idx - 1);
+        msg.set_log_term(term);
+        msg.set_entries(RepeatedField::from_vec(ents));
+        msg.set_commit(self.raft_log.committed);
+        if !msg.get_entries().is_empty() {
+            match pr.state {
+                ProgressState::Replicate => {
+                    let last = msg.get_entries().last().unwrap().get_index();
+                    pr.optimistic_update(last);
+                    pr.ins.add(last);
+                }
+                ProgressState::Probe => pr.pause(),
+                _ => panic!(
+                    "{} is sending append in unhandle state {:?}",
+                    self.tag, pr.state
+                ),
+            }
+        }
+    }
+
+    pub fn send_append(&mut self, to: u64, pr: &mut Progress) {
+        if pr.is_paused() {
+            return;
+        }
+        let term = self.raft_log.term(pr.next_idx - 1);
+        let ents = self.raft_log.entries(pr.next_idx, self.max_msg_size);
+        let mut msg = Message::new();
+        msg.set_to(to);
+        if term.is_err() || ents.is_err() {
+            if !self.prepare_send_snapshot(&mut msg, pr, to) {
+                return;
+            }
+        } else {
+            self.prepare_send_entries(&mut msg, pr, term.unwrap(), ents.unwrap());
+        }
+        self.send(msg);
+    }
+
+    fn send_heartbeat(&mut self, to: u64, pr: &Progress, ctx: Option<Vec<u8>>) {
+        let mut msg = Message::new();
+        msg.set_to(to);
+        msg.set_msg_type(MessageType::MsgHeartbeat);
+        let commit = cmp::min(pr.matched, self.raft_log.committed);
+        msg.set_commit(commit);
+        if let Some(context) = ctx {
+            msg.set_context(context);
+        }
+        self.send(msg);
+    }
+
+    pub fn bcast_send(&mut self) {
+        let self_id = self.id;
+        let mut prs = self.take_prs();
+        prs.iter_mut()
+            .filter(|&(id, _)| *id != self_id)
+            .for_each(|(id, pr)| self.send_append(*id, pr));
+        self.set_prs(prs);
+    }
+
+    pub fn bcast_heartbeat(&mut self) {
+        let ctx = self.read_only.last_pending_request_ctx();
+        self.bcast_heartbeat_with_ctx(ctx);
+    }
+
+    fn bcast_heartbeat_with_ctx(&mut self, ctx: Option<Vec<u8>>) {
+        let self_id = self.id;
+        let mut prs = self.take_prs();
+        prs.iter_mut()
+            .filter(|(&id, _)| *id != self_id)
+            .for_each(|(id, pr)| self.send_heartbeat(*id, pr, ctx.clone()));
+        self.set_prs(prs);
+    }
+
+    pub fn maybe_commit(&mut self) -> bool {
+        let mci = self.prs().maximal_committed_index();
+        self.raft_log.maybe_commit(mci, self.term)
+    }
+
     pub fn reset(&mut self, term: u64) {
         if self.term != term {
             self.term = term;
@@ -359,11 +507,200 @@ impl<T: Storage> Raft<T> {
         }
     }
 
+    pub fn append_entry(&mut self, ents: &mut [Entry]) {
+        let mut li = self.raft_log.last_index();
+        for (i, e) in ents.iter_mut().enumerate() {
+            e.set_term(self.term);
+            e.set_index(li + 1 + i as u64);
+        }
+        li = self.raft_log.append(ents);
+
+        let self_id = self.id;
+        self.mut_prs().get_mut(self_id).unwrap().maybe_update(li);
+
+        self.maybe_commit();
+    }
+
+    pub fn tick(&mut self) -> bool {
+        match self.state {
+            StateRole::FOLLOWER | StateRole::Candidate => self.to,
+        }
+    }
+
+    pub fn tick_election(&mut self) -> bool {
+        self.election_elapsed += 1;
+        if !self.pass_election_timeout() || !self.promotable() {
+            return false;
+        }
+
+        self.election_elapsed = 0;
+        let msg = new_message(INVALID_ID, MessageType::MsgHup, Some(self.id));
+        //        self.step();
+        true
+    }
+
     pub fn become_follower(&mut self, term: u64, leader_id: u64) {
         self.reset(term);
         self.leader_id = leader_id;
         self.state = StateRole::FOLLOWER;
         info!("{} become follower at term {}", self.tag, self.term);
+    }
+
+    fn num_pending_conf(&self, ents: &[Entry]) -> usize {
+        ents.into_iter()
+            .filter(|e| e.get_entry_type() == EntryType::EntryConfChange)
+            .count()
+    }
+
+    pub fn step(&mut self, msg: Message) -> Result<()> {
+        if msg.get_term() == 0 {
+            // local message
+        } else if msg.get_term() > self.term {
+            if msg.get_msg_type() == MessageType::MsgRequestVote
+                || msg.get_msg_type() == MessageType::MsgRequestPreVote
+            {
+                let force = msg.get_context() == CAMPAIGN_TRANSFER;
+                let in_lease = self.check_quorum
+                    && self.leader_id != INVALID_ID
+                    && self.election_elapsed < self.election_timeout;
+                if !force && in_lease {
+                    info!(
+                        "{} [log_term: {}, index: {}, vote: {}] ignored {:?} vote from \
+                         {} [log_term: {}, index: {}] at term {}: lease is not expired \
+                         (remaining ticks: {})",
+                        self.tag,
+                        self.raft_log.last_term(),
+                        self.raft_log.last_index(),
+                        self.vote,
+                        msg.get_msg_type(),
+                        msg.get_from(),
+                        msg.get_log_term(),
+                        msg.get_index(),
+                        self.term,
+                        self.election_timeout - self.election_elapsed
+                    );
+                }
+
+                return Ok(());
+            }
+
+            if msg.get_msg_type() == MessageType::MsgRequestPreVote
+                || (msg.get_msg_type() == MessageType::MsgRequestPreVoteResponse
+                    && !msg.get_reject())
+            {
+                // do not support this
+            } else {
+                info!(
+                    "{} [term: {}] received a {:?} message with higher term form {} [term: {}]",
+                    self.tag,
+                    self.term,
+                    msg.get_msg_type(),
+                    msg.get_from(),
+                    msg.get_term()
+                );
+                if msg.get_msg_type() == MessageType::MsgAppend
+                    || msg.get_msg_type() == MessageType::MsgHeartbeat
+                    || msg.get_msg_type() == MessageType::MsgSnapshot
+                {
+                    self.become_follower(msg.get_term(), msg.get_from());
+                } else {
+                    self.become_follower(msg.get_term(), INVALID_ID);
+                }
+            }
+        } else if msg.get_term() < self.term {
+            if (self.check_quorum || self.pre_vote)
+                && (msg.get_msg_type() == MessageType::MsgHeartbeat
+                    || msg.get_msg_type() == MessageType::MsgAppend)
+            {
+                let to_send = new_message(msg.get_from(), MessageType::MsgAppendResponse, None);
+                self.send(to_send);
+            } else if msg.get_msg_type() == MessageType::MsgRequestPreVote {
+                info!(
+                    "{} [log_term: {}, index: {}, vote: {}] rejected {:?} from {} [log_term: {}, index: {}] at term {}",
+                    self.id,
+                    self.raft_log.last_term(),
+                    self.raft_log.last_index(),
+                    self.vote,
+                    msg.get_msg_type(),
+                    msg.get_from(),
+                    msg.get_log_term(),
+                    msg.get_index(),
+                    self.term,
+                );
+
+                let mut to_send =
+                    new_message(msg.get_from(), MessageType::MsgRequestPreVoteResponse, None);
+                to_send.set_term(self.term);
+                to_send.set_reject(true);
+                self.send(to_send);
+            } else {
+                info!(
+                    "{} [term: {}] ignored a {:?} message with lower term from {} [term: {}]",
+                    self.tag,
+                    self.term,
+                    msg.get_msg_type(),
+                    msg.get_from(),
+                    msg.get_term(),
+                );
+            }
+            return Ok(());
+        }
+
+        #[cfg(feature = "failpoint")]
+        fail_point!("before_step");
+
+        match msg.get_msg_type() {
+            MessageType::MsgHup => {
+                if self.state != StateRole::Leader {
+                    let ents = self
+                        .raft_log
+                        .slice(
+                            self.raft_log.applied + 1,
+                            self.raft_log.committed + 1,
+                            raft_log::NO_LIMIT,
+                        )
+                        .expect("unexpected error getting un-applied entries");
+
+                    let n = self.num_pending_conf(&ents);
+                    if n != 0 && self.raft_log.committed > self.raft_log.applied {
+                        warn!(
+                            "{} cannot campaign at term {} since there are still {} pending configuration changes to apply",
+                            self.tag, self.term, n,
+                        );
+                        return Ok(());
+                    }
+                    info!(
+                        "{} is starting a new election at term {}",
+                        self.tag, self.term,
+                    );
+                    if self.pre_vote {
+                        self.campaign(CAMPAIGN_PRE_ELECTION);
+                    } else {
+                        self.campaign(CAMPAIGN_ELECTION);
+                    }
+                } else {
+                    debug!("{} ignoring MsgHup because already leader", self.tag);
+                }
+            }
+
+            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {}
+
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    pub fn promotable(&self) -> bool {
+        self.prs().voter_ids().contains(&self.id)
+    }
+
+    pub fn take_prs(&mut self) -> ProgressSet {
+        self.prs.take().unwrap()
+    }
+
+    pub fn set_prs(&mut self, prs: ProgressSet) {
+        self.prs = Some(prs);
     }
 
     pub fn prs(&self) -> &ProgressSet {
@@ -388,6 +725,10 @@ impl<T: Storage> Raft<T> {
         self.raft_log.committed = hs.get_commit();
         self.term = hs.get_term();
         self.vote = hs.get_vote();
+    }
+
+    pub fn pass_election_timeout(&self) -> bool {
+        self.election_elapsed >= self.randomized_election_timeout
     }
 
     pub fn reset_randomized_election_timeout(&mut self) {

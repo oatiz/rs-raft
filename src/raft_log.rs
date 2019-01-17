@@ -5,6 +5,8 @@ use std::cmp;
 use storage::Storage;
 use util;
 
+pub use util::NO_LIMIT;
+
 #[derive(Default)]
 pub struct RaftLog<T: Storage> {
     pub store: T,
@@ -220,14 +222,63 @@ impl<T: Storage> RaftLog<T> {
         Some(&self.unstable.entries)
     }
 
-    pub fn entries(&self, idx: u64, max_idx: u64) -> Result<Vec<Entry>> {
+    pub fn entries(&self, idx: u64, max_size: u64) -> Result<Vec<Entry>> {
         let last = self.last_index();
 
         if idx > last {
             return Ok(Vec::new());
         }
 
-        self.sli
+        self.slice(idx, last + 1, max_size)
+    }
+
+    pub fn all_entries(&self) -> Vec<Entry> {
+        let first_index = self.first_index();
+        match self.entries(first_index, NO_LIMIT) {
+            Err(e) => {
+                if e == Error::Store(StorageError::Compacted) {
+                    return self.all_entries();
+                }
+                panic!("{} unexpected error: {:?}", self.tag, e);
+            }
+            Ok(entries) => entries,
+        }
+    }
+
+    pub fn is_up_to_date(&self, last_index: u64, term: u64) -> bool {
+        term > self.last_term() || (term == self.last_term() && last_index >= self.last_index())
+    }
+
+    pub fn next_entries_since(&self, since_idx: u64) -> Option<Vec<Entry>> {
+        let offset = cmp::max(since_idx + 1, self.first_index());
+        let committed = self.committed;
+        if committed + 1 > offset {
+            match self.slice(offset, committed + 1, NO_LIMIT) {
+                Ok(vec) => return Some(vec),
+                Err(e) => panic!("{} unexpected error: {:?}", self.tag, e),
+            }
+        }
+        None
+    }
+
+    pub fn next_entries(&self) -> Option<Vec<Entry>> {
+        self.next_entries_since(self.applied)
+    }
+
+    pub fn has_next_entries_since(&self, since_idx: u64) -> bool {
+        let offset = cmp::max(since_idx + 1, self.first_index());
+        self.committed + 1 > offset
+    }
+
+    pub fn has_next_entries(&self) -> bool {
+        self.has_next_entries_since(self.applied)
+    }
+
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        self.unstable
+            .snapshot
+            .clone()
+            .map_or_else(|| self.store.snapshot(), Ok)
     }
 
     fn must_check_out_of_bounds(&self, low: u64, high: u64) -> Option<Error> {
@@ -253,6 +304,15 @@ impl<T: Storage> RaftLog<T> {
         }
 
         None
+    }
+
+    pub fn maybe_commit(&mut self, max_index: u64, term: u64) -> bool {
+        if max_index > self.committed && self.term(max_index).unwrap_or(0) == term {
+            self.commit_to(max_index);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn slice(&self, low: u64, high: u64, max_size: u64) -> Result<Vec<Entry>> {
