@@ -27,6 +27,7 @@ pub enum StateRole {
     Candidate,
     /// 领导人, (系统所有的更改都通过leader操作)
     Leader,
+    PreCandidate,
 }
 
 impl Default for StateRole {
@@ -683,12 +684,87 @@ impl<T: Storage> Raft<T> {
                 }
             }
 
-            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {}
+            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {
+                let can_vote = (self.vote == msg.get_from())
+                    || (self.vote == INVALID_ID && self.leader_id == INVALID_ID)
+                    || (msg.get_msg_type() == MessageType::MsgRequestPreVote
+                        && msg.get_term() > self.term);
 
-            _ => {}
+                if can_vote
+                    && self
+                        .raft_log
+                        .is_up_to_date(msg.get_index(), msg.get_log_term())
+                {
+                    self.log_vote_approve(&msg);
+                    let mut to_send =
+                        new_message(msg.get_from(), vote_resp_msg_type(msg.get_msg_type()), None);
+                    to_send.set_reject(false);
+                    to_send.set_term(msg.get_term());
+                    self.send(to_send);
+                    if msg.get_msg_type() == MessageType::MsgRequestVote {
+                        self.election_elapsed = 0;
+                        self.vote = msg.get_from();
+                    }
+                } else {
+                    self.log_vote_reject(&msg);
+                    let mut to_send =
+                        new_message(msg.get_from(), vote_resp_msg_type(msg.get_msg_type()), None);
+                    to_send.set_reject(true);
+                    to_send.set_term(self.term);
+                    self.send(to_send);
+                }
+            }
+
+            _ => match self.state {
+                StateRole::PreCandidate | StateRole::Candidate => self.step_candidate(msg)?,
+                StateRole::FOLLOWER => self.step_follower(msg)?,
+                StateRole::Leader => self.step_leader(msg)?,
+            },
         }
 
         Ok(())
+    }
+
+    fn log_vote_approve(&self, msg: &Message) {
+        info!(
+            "{} [log_term: {}, index: {}, vote: {}] cast {:?} for {} [log_term: {}, index: {}] at term {}",
+            self.tag,
+            self.raft_log.last_term(),
+            self.raft_log.last_index(),
+            self.vote,
+            msg.get_msg_type(),
+            msg.get_from(),
+            msg.get_log_term(),
+            msg.get_index(),
+            self.term
+        );
+    }
+
+    fn log_vote_reject(&self, msg: &Message) {
+        info!(
+            "{} [log_term: {}, index: {}, vote: {}] rejected {:?} from {} [log_term: {}, index: {}] at term {}",
+            self.tag,
+            self.raft_log.last_term(),
+            self.raft_log.last_index(),
+            self.vote,
+            msg.get_msg_type(),
+            msg.get_from(),
+            msg.get_log_term(),
+            msg.get_index(),
+            self.term
+        );
+    }
+
+    fn step_leader(&mut self, mut m: Message) -> Result<()> {
+        unimplemented!()
+    }
+
+    fn step_candidate(&mut self, m: Message) -> Result<()> {
+        unimplemented!()
+    }
+
+    fn step_follower(&mut self, mut m: Message) -> Result<()> {
+        unimplemented!()
     }
 
     pub fn promotable(&self) -> bool {
