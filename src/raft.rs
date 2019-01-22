@@ -453,7 +453,7 @@ impl<T: Storage> Raft<T> {
         self.send(msg);
     }
 
-    pub fn bcast_send(&mut self) {
+    pub fn bcast_append(&mut self) {
         let self_id = self.id;
         let mut prs = self.take_prs();
         prs.iter_mut()
@@ -540,6 +540,10 @@ impl<T: Storage> Raft<T> {
         true
     }
 
+    pub fn campaign(&mut self, campaign_type: &[u8]) {
+        unimplemented!()
+    }
+
     pub fn become_follower(&mut self, term: u64, leader_id: u64) {
         self.reset(term);
         self.leader_id = leader_id;
@@ -547,10 +551,18 @@ impl<T: Storage> Raft<T> {
         info!("{} become follower at term {}", self.tag, self.term);
     }
 
+    pub fn become_leader(&mut self) {
+        unimplemented!();
+    }
+
     fn num_pending_conf(&self, ents: &[Entry]) -> usize {
         ents.into_iter()
             .filter(|e| e.get_entry_type() == EntryType::EntryConfChange)
             .count()
+    }
+
+    fn register_vote(&mut self, id: u64, vote: bool) {
+        self.votes.entry(id).or_insert(vote);
     }
 
     pub fn step(&mut self, msg: Message) -> Result<()> {
@@ -755,16 +767,254 @@ impl<T: Storage> Raft<T> {
         );
     }
 
-    fn step_leader(&mut self, mut m: Message) -> Result<()> {
+    fn step_leader(&mut self, mut msg: Message) -> Result<()> {
         unimplemented!()
     }
 
-    fn step_candidate(&mut self, m: Message) -> Result<()> {
+    fn step_candidate(&mut self, msg: Message) -> Result<()> {
+        match msg.get_msg_type() {
+            MessageType::MsgPropose => {
+                info!(
+                    "{} no leader at term {}; dropping proposal",
+                    self.tag, self.term
+                );
+                return Err(Error::ProposalDropped);
+            }
+            MessageType::MsgAppend => {
+                debug_assert_eq!(self.term, msg.get_term());
+                self.become_follower(msg.get_term(), msg.get_from());
+                self.handler_append_entries(&msg);
+            }
+            MessageType::MsgHeartbeat => {
+                debug_assert_eq!(self.term, msg.get_term());
+                self.become_follower(msg.get_term(), msg.get_from());
+                self.handler_heartbeat(msg);
+            }
+            MessageType::MsgSnapshot => {
+                debug_assert_eq!(self.term, msg.get_term());
+                self.become_follower(self.term, msg.get_term());
+                self.handler_snapshot(msg);
+            }
+            MessageType::MsgRequestPreVoteResponse | MessageType::MsgRequestVoteResponse => {
+                if (self.state == StateRole::PreCandidate
+                    && msg.get_msg_type() != MessageType::MsgRequestPreVoteResponse)
+                    || (self.state == StateRole::Candidate
+                        && msg.get_msg_type() != MessageType::MsgRequestVoteResponse)
+                {
+                    return Ok(());
+                }
+
+                let acceptance = !msg.get_reject();
+                let msg_type = msg.get_msg_type();
+                let from_id = msg.get_from();
+                info!(
+                    "{} received {:?}{} from {} at term {}",
+                    self.id,
+                    msg_type,
+                    if !acceptance { " rejection " } else { "" },
+                    from_id,
+                    self.term,
+                );
+                self.register_vote(from_id, acceptance);
+                match self.prs().candidacy_status(self.id, &self.votes) {
+                    CandidacyStatus::Elected => {
+                        if self.state == StateRole::PreCandidate {
+                            self.campaign(CAMPAIGN_ELECTION);
+                        } else {
+                            self.become_leader();
+                            self.bcast_append();
+                        }
+                    }
+                    CandidacyStatus::Ineligible => {
+                        let term = self.term;
+                        self.become_follower(term, INVALID_ID);
+                    }
+                    CandidacyStatus::Eligible => {}
+                }
+            }
+            MessageType::MsgTimeoutNow => debug!(
+                "{} [term {} state {:?}] ignored MsgTimeoutNow from {}",
+                self.tag,
+                self.term,
+                self.state,
+                msg.get_from(),
+            ),
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn step_follower(&mut self, mut msg: Message) -> Result<()> {
         unimplemented!()
     }
 
-    fn step_follower(&mut self, mut m: Message) -> Result<()> {
-        unimplemented!()
+    pub fn handler_append_entries(&mut self, msg: &Message) {
+        if msg.get_index() < self.raft_log.committed {
+            let mut to_send = Message::new();
+            to_send.set_to(msg.get_from());
+            to_send.set_msg_type(MessageType::MsgAppendResponse);
+            to_send.set_index(self.raft_log.committed);
+            self.send(to_send);
+            return;
+        }
+
+        let mut to_send = Message::new();
+        to_send.set_to(msg.get_from());
+        to_send.set_msg_type(MessageType::MsgAppendResponse);
+        match self.raft_log.maybe_append(
+            msg.get_index(),
+            msg.get_term(),
+            msg.get_commit(),
+            msg.get_entries(),
+        ) {
+            Some(msg_last_index) => {
+                to_send.set_index(msg_last_index);
+                self.send(to_send);
+            }
+            None => {
+                debug!(
+                    "{} [log_term: {}, index: {}] rejected msgApp [log_term: {}, index: {}] from {}",
+                    self.tag,
+                    self.raft_log.term(m.get_index()).unwrap_or(0),
+                    m.get_index(),
+                    m.get_log_term(),
+                    m.get_index(),
+                    m.get_from()
+                );
+                to_send.set_index(m.get_index());
+                to_send.set_reject(true);
+                to_send.set_reject_hint(self.raft_log.last_index());
+                self.send(to_send);
+            }
+        }
+    }
+
+    pub fn handler_heartbeat(&mut self, mut msg: Message) {
+        self.raft_log.commit_to(msg.get_commit());
+        let mut to_send = Message::new();
+        to_send.set_to(msg.get_from());
+        to_send.set_msg_type(MessageType::MsgHeartbeatResponse);
+        to_send.set_context(msg.take_context());
+        self.send(to_send);
+    }
+
+    fn handler_snapshot(&mut self, mut msg: Message) {
+        let (s_index, s_term) = (
+            msg.get_snapshot().get_metadata().get_index(),
+            msg.get_snapshot().get_metadata().get_term(),
+        );
+        if self.restore(msg.take_snapshot()) {
+            info!(
+                "{} [commit: {}] restored snapshot [index: {}, term: {}]",
+                self.tag, self.raft_log.committed, s_index, s_term,
+            );
+            let mut to_send = Message::new();
+            to_send.set_to(msg.get_from());
+            to_send.set_msg_type(MessageType::MsgAppendResponse);
+            to_send.set_index(self.raft_log.last_index());
+            self.send(to_send);
+        } else {
+            info!(
+                "{} [commit: {}] ignored snapshot [index: {}, term: {}]",
+                self.tag, self.raft_log.committed, s_index, s_term,
+            );
+            let mut to_send = Message::new();
+            to_send.set_to(msg.get_from());
+            to_send.set_msg_type(MessageType::MsgAppendResponse);
+            to_send.set_index(self.raft_log.committed);
+            self.send(to_send);
+        }
+    }
+
+    pub fn restore_raft(&mut self, snap: &Snapshot) -> Option<bool> {
+        let meta = snap.get_metadata();
+        if self.raft_log.match_term(meta.get_index(), meta.get_term()) {
+            info!(
+                "{} [commit: {}, last_index: {}, last_term: {}] fast-forwarded commit to snapshot [index: {}, term: {}]",
+                self.tag,
+                self.raft_log.committed,
+                self.raft_log.last_index(),
+                self.raft_log.last_term(),
+                meta.get_index(),
+                meta.get_term()
+            );
+            self.raft_log.commit_to(meta.get_index());
+            return Some(false);
+        }
+
+        if self.prs().iter().len() != 0 && !self.is_learner {
+            for &id in meta.get_conf_state().get_learners() {
+                if id == self.id {
+                    error!(
+                        "{} can not become learner when restores snapshot [index: {}, term: {}]",
+                        self.tag,
+                        meta.get_index(),
+                        meta.get_term(),
+                    );
+                    return Some(false);
+                }
+            }
+        }
+
+        info!(
+            "{} [commit: {}, last_index: {}, last_term: {}] starts to restore snapshot [index: {}, term: {}]",
+            self.tag,
+            self.raft_log.committed,
+            self.raft_log.last_index(),
+            self.raft_log.last_term(),
+            meta.get_index(),
+            meta.get_term()
+        );
+
+        let nodes = meta.get_conf_state().get_nodes();
+        let learners = meta.get_conf_state().get_learners();
+        self.prs = Some(ProgressSet::with_capacity(nodes.len(), learners.len()));
+
+        for &(is_learner, nodes) in &[(false, nodes), (true, learners)] {
+            for &n in nodes {
+                let next_index = self.raft_log.last_index() + 1;
+                let mut matched = 0;
+                if n == self.id {
+                    matched = next_index - 1;
+                    self.is_learner = is_learner;
+                }
+                self.set_progress(n, matched, next_index, is_learner);
+                info!(
+                    "{} restored progress of {} [{:?}]",
+                    self.tag,
+                    n,
+                    self.prs().get(n),
+                );
+            }
+        }
+
+        None
+    }
+
+    pub fn restore(&mut self, snap: Snapshot) -> bool {
+        if snap.get_metadata().get_index() < self.raft_log.committed {
+            return false;
+        }
+
+        if let Some(b) = self.restore_raft(&snap) {
+            return b;
+        }
+
+        self.raft_log.restore(snap);
+        true
+    }
+
+    pub fn set_progress(&mut self, id: u64, matched: u64, next_idx: u64, is_learner: bool) {
+        let mut pr = Progress::new(next_idx, self.max_inflight);
+        pr.matched = matched;
+        if is_learner {
+            if let Err(e) = self.mut_prs().insert_learner(id, pr) {
+                panic!("{}", e);
+            }
+        } else if let Err(e) = self.mut_prs().insert_voter(id, pr) {
+            panic!("{}", e);
+        }
     }
 
     pub fn promotable(&self) -> bool {
