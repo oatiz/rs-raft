@@ -524,7 +524,10 @@ impl<T: Storage> Raft<T> {
 
     pub fn tick(&mut self) -> bool {
         match self.state {
-            StateRole::FOLLOWER | StateRole::Candidate => self.to,
+            StateRole::FOLLOWER | StateRole::PreCandidate | StateRole::Candidate => {
+                self.tick_election()
+            }
+            StateRole::Leader => self.tick_heartbeat(),
         }
     }
 
@@ -536,12 +539,39 @@ impl<T: Storage> Raft<T> {
 
         self.election_elapsed = 0;
         let msg = new_message(INVALID_ID, MessageType::MsgHup, Some(self.id));
-        //        self.step();
+        self.step(msg).is_ok();
         true
     }
 
-    pub fn campaign(&mut self, campaign_type: &[u8]) {
-        unimplemented!()
+    fn tick_heartbeat(&mut self) -> bool {
+        self.heartbeat_elapsed += 1;
+        self.election_elapsed += 1;
+
+        let mut has_ready = false;
+        if self.election_elapsed >= self.election_timeout {
+            self.election_elapsed = 0;
+            if self.check_quorum {
+                let msg = new_message(INVALID_ID, MessageType::MsgCheckQuorum, Some(self.id));
+                has_ready = true;
+                self.step(msg).is_ok();
+            }
+            if self.state == StateRole::Leader && self.lead_transferee.is_some() {
+                self.abort_leader_transfer();
+            }
+        }
+
+        if self.state != StateRole::Leader {
+            return has_ready;
+        }
+
+        if self.heartbeat_elapsed >= self.heartbeat_timeout {
+            self.heartbeat_elapsed = 0;
+            has_ready = true;
+            let msg = new_message(INVALID_ID, MessageType::MsgBeat, Some(self.id));
+            self.step(msg).is_ok();
+        }
+
+        has_ready
     }
 
     pub fn become_follower(&mut self, term: u64, leader_id: u64) {
@@ -551,14 +581,108 @@ impl<T: Storage> Raft<T> {
         info!("{} become follower at term {}", self.tag, self.term);
     }
 
+    pub fn become_candidate(&mut self) {
+        assert_ne!(
+            self.state,
+            StateRole::Leader,
+            "invalid transition [leader -> candidate]",
+        );
+        let term = self.term + 1;
+        self.reset(term);
+        let id = self.id;
+        self.vote = id;
+        self.state = StateRole::Candidate;
+        info!("{} became candidate at term {}", self.tag, self.term);
+    }
+
+    pub fn become_pre_candidate(&mut self) {
+        assert_ne!(
+            self.state,
+            StateRole::Leader,
+            "invalid transition [leader -> pre-candidate]",
+        );
+        self.state = StateRole::PreCandidate;
+        self.votes = FxHashMap::new();
+
+        self.leader_id = INVALID_ID;
+        info!("{} became pre-candidate at term {}", self.tag, self.term);
+    }
+
     pub fn become_leader(&mut self) {
-        unimplemented!();
+        assert_ne!(
+            self.state,
+            StateRole::Leader,
+            "invalid transition [follower -> leader]",
+        );
+        let term = self.term;
+        self.reset(term);
+        self.leader_id = self.id;
+        self.state = StateRole::Leader;
+
+        let id = self.id;
+        self.mut_prs().get_mut(id).unwrap().become_replicate();
+
+        self.pending_conf_index = self.raft_log.last_index();
+
+        self.append_entry(&mut [Entry::new()]);
+        info!("{} became leader at term {}", self.tag, self.term);
     }
 
     fn num_pending_conf(&self, ents: &[Entry]) -> usize {
         ents.into_iter()
             .filter(|e| e.get_entry_type() == EntryType::EntryConfChange)
             .count()
+    }
+
+    pub fn campaign(&mut self, campaign_type: &[u8]) {
+        let (vote_msg, term) = if campaign_type == CAMPAIGN_PRE_ELECTION {
+            self.become_pre_candidate();
+            (MessageType::MsgRequestPreVote, self.term + 1)
+        } else {
+            self.become_candidate();
+            (MessageType::MsgRequestVote, self.term)
+        };
+
+        let self_id = self.id;
+        let acceptance = true;
+        info!(
+            "{} received {:?} from {} at term {}",
+            self.id, vote_msg, self_id, self.term,
+        );
+        self.register_vote(self_id, acceptance);
+        if let CandidacyStatus::Elected = self.prs().candidacy_status(self.id, &self.votes) {
+            if campaign_type == CAMPAIGN_PRE_ELECTION {
+                self.campaign(CAMPAIGN_ELECTION);
+            } else {
+                self.become_leader();
+            }
+            return;
+        }
+
+        let prs = self.take_prs();
+        prs.voter_ids()
+            .iter()
+            .filter(|&id| *id != self_id)
+            .for_each(|&id| {
+                info!(
+                    "{} [log_term: {}, index: {}] sent {:?} request to {} at term {}",
+                    self.tag,
+                    self.raft_log.last_term(),
+                    self.raft_log.last_index(),
+                    vote_msg,
+                    id,
+                    self.term,
+                );
+                let mut msg = new_message(id, vote_msg, None);
+                msg.set_term(term);
+                msg.set_index(self.raft_log.last_index());
+                msg.set_log_term(self.raft_log.last_term());
+                if campaign_type == CAMPAIGN_TRANSFER {
+                    msg.set_context(campaign_type.to_vec());
+                }
+                self.send(msg);
+            });
+        self.set_prs(prs);
     }
 
     fn register_vote(&mut self, id: u64, vote: bool) {
